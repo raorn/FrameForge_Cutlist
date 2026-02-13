@@ -1,0 +1,145 @@
+# vim: ft=python
+
+import FreeCAD as App
+import re
+
+# ========== КОНСТАНТЫ ==========
+
+STOCK_LEN = 3000          # длина заготовки (мм)
+KERF = 2                  # толщина пропила (мм)
+
+MATERIAL_DEFAULT = "Труба"
+
+# Цвета (RGB 0..1)
+COLOR_HEADER = (0.85, 0.85, 0.85)
+COLOR_ROW_A  = (0.95, 0.95, 0.95)
+COLOR_ROW_B  = (0.90, 0.90, 0.90)
+COLOR_TEXT   = (0.0, 0.0, 0.0)
+
+# ========== СБОР ДЕТАЛЕЙ ==========
+
+doc = App.ActiveDocument
+parts = {}  # (material, length) -> qty
+
+for o in doc.Objects:
+    if not hasattr(o, "Shape"):
+        continue
+
+    if not o.Visibility:
+        continue
+
+    if not o.Name.startswith("Profile_"):
+        continue
+
+    # код профиля (XXX)
+    m = re.match(r"Profile_([^_]+)_", o.Name)
+    if not m:
+        continue
+
+    profile_code = m.group(1)
+    material = f"{MATERIAL_DEFAULT} {profile_code}"
+
+    max_len = 0
+    for e in o.Shape.Edges:
+        if e.Curve.__class__.__name__ == "Line":
+            L = e.Length
+            if 40 < L < 10000:
+                max_len = max(max_len, L)
+
+    if max_len == 0:
+        continue
+
+    L = int(round(max_len, 1))
+
+    key = (material, L)
+    parts[key] = parts.get(key, 0) + 1
+
+# ========== СОЗДАНИЕ ТАБЛИЦЫ ==========
+
+sheet = doc.addObject('Spreadsheet::Sheet','CutList')
+
+row = 1
+
+# ---- Заголовок ----
+sheet.set(f"A{row}", "Материал")
+sheet.set(f"B{row}", "Длина (мм)")
+sheet.set(f"C{row}", "Кол-во")
+# место под будущее:
+sheet.set(f"D{row}", "Запил (TODO)")
+sheet.setBackground(f"A{row}:D{row}", COLOR_HEADER)
+sheet.setForeground(f"A{row}:D{row}", COLOR_TEXT)
+
+row += 1
+
+# ---- Список деталей ----
+sorted_parts = sorted(parts.items(), key=lambda x: (x[0][0], -x[0][1]))
+
+for i, ((material, L), qty) in enumerate(sorted_parts):
+    sheet.set(f"A{row}", material)
+    sheet.set(f"B{row}", str(L))
+    sheet.set(f"C{row}", str(qty))
+
+    # тут позже можно будет добавить:
+    # - углы митра
+    # - плоскость реза
+    # - один/два торца
+
+    bg = COLOR_ROW_A if i % 2 == 0 else COLOR_ROW_B
+    sheet.setBackground(f"A{row}:D{row}", bg)
+    sheet.setForeground(f"A{row}:D{row}", COLOR_TEXT)
+
+    row += 1
+
+row += 1
+
+# ========== РАСКРОЙ ПО МАТЕРИАЛАМ ==========
+
+sheet.set(f"A{row}", "РАСКРОЙ ИЗ 3м ЗАГОТОВОК")
+sheet.setBackground(f"A{row}:D{row}", COLOR_HEADER)
+sheet.setForeground(f"A{row}:D{row}", COLOR_TEXT)
+row += 1
+
+# группировка по материалу
+by_material = {}
+for (material, L), qty in parts.items():
+    by_material.setdefault(material, []).extend([L]*qty)
+
+for material, pieces in by_material.items():
+
+    sheet.set(f"A{row}", material)
+    sheet.setBackground(f"A{row}:D{row}", COLOR_HEADER)
+    row += 1
+
+    pieces.sort(reverse=True)
+
+    bars = []
+
+    for p in pieces:
+        placed = False
+
+        for b in bars:
+            used = sum(b) + KERF*(len(b))  # учёт пропилов
+            if used + p <= STOCK_LEN:
+                b.append(p)
+                placed = True
+                break
+
+        if not placed:
+            bars.append([p])
+
+    for i, b in enumerate(bars, 1):
+        sheet.set(f"A{row}", f"{MATERIAL_DEFAULT} {i}")
+
+        used = sum(b) + KERF*(len(b)-1 if len(b)>0 else 0)
+        rest = STOCK_LEN - used
+
+        sheet.set(f"B{row}", " + ".join(str(x) for x in b))
+        sheet.set(f"C{row}", f"Остаток: {round(rest,1)}")
+
+        bg = COLOR_ROW_A if i % 2 == 0 else COLOR_ROW_B
+        sheet.setBackground(f"A{row}:D{row}", bg)
+        row += 1
+
+    row += 1
+
+doc.recompute()
