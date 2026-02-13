@@ -1,145 +1,244 @@
 # vim: ft=python
 
 import FreeCAD as App
-import re
 
-# ========== КОНСТАНТЫ ==========
+DOC = App.ActiveDocument
 
-STOCK_LEN = 3000          # длина заготовки (мм)
-KERF = 2                  # толщина пропила (мм)
+# ---------------- КОНСТАНТЫ ----------------
 
-MATERIAL_DEFAULT = "Труба"
+DEFAULT_MATERIAL = "Профруба"
 
-# Цвета (RGB 0..1)
+STOCK_LENGTH = 3000.0
+KERF = 2.0
+
+ROUND_TO = 1          # 0.1 мм
+MIN_LENGTH = 10.0
+MAX_LENGTH = 6000.0
+
 COLOR_HEADER = (0.85, 0.85, 0.85)
-COLOR_ROW_A  = (0.95, 0.95, 0.95)
+COLOR_ROW_A  = (0.96, 0.96, 0.96)
 COLOR_ROW_B  = (0.90, 0.90, 0.90)
-COLOR_TEXT   = (0.0, 0.0, 0.0)
+TEXT_COLOR   = (0.0, 0.0, 0.0)
 
-# ========== СБОР ДЕТАЛЕЙ ==========
+DEBUG = True
 
-doc = App.ActiveDocument
-parts = {}  # (material, length) -> qty
 
-for o in doc.Objects:
+# ---------------- УТИЛИТЫ ----------------
+
+def log(msg):
+    if DEBUG:
+        App.Console.PrintMessage(str(msg) + "\n")
+
+
+def get_length(obj):
+    bb = obj.Shape.BoundBox
+    L = max(bb.XLength, bb.YLength, bb.ZLength)
+    return round(L, ROUND_TO)
+
+
+def get_profile_code(obj):
+    name = obj.Name
+    parts = name.split("_")
+    if len(parts) < 2:
+        return None
+    if parts[0] != "Profile":
+        return None
+    return parts[1]
+
+
+def get_material(obj):
+    code = get_profile_code(obj)
+    if not code:
+        return None
+    return f"{DEFAULT_MATERIAL} {code}"
+
+
+def get_trim(obj, prop):
+    if hasattr(obj, prop):
+        try:
+            v = getattr(obj, prop)
+            log(f"{obj.Name}  {prop} = {v}")
+            return float(v)
+        except:
+            pass
+    return 0.0
+
+
+def canonical_key(length, material, a1, a2, r2):
+    k1 = (length, material, a1, a2, r2)
+    k2 = (length, material, a2, a1, (r2 + 180.0) % 360.0)
+    return min(str(k1), str(k2))
+
+
+def pack_stock(lengths):
+    lengths = sorted(lengths, reverse=True)
+    stocks = []
+
+    for L in lengths:
+        placed = False
+        for stock in stocks:
+            used = sum(stock) + KERF * (len(stock))
+            if used + L <= STOCK_LENGTH:
+                stock.append(L)
+                placed = True
+                break
+        if not placed:
+            stocks.append([L])
+
+    return stocks
+
+
+# ---------------- СБОР ДЕТАЛЕЙ ----------------
+
+items = {}
+
+for o in DOC.Objects:
+
     if not hasattr(o, "Shape"):
         continue
-
     if not o.Visibility:
         continue
 
-    if not o.Name.startswith("Profile_"):
+    code = get_profile_code(o)
+    if not code:
         continue
 
-    # код профиля (XXX)
-    m = re.match(r"Profile_([^_]+)_", o.Name)
-    if not m:
+    try:
+        L = get_length(o)
+    except:
         continue
 
-    profile_code = m.group(1)
-    material = f"{MATERIAL_DEFAULT} {profile_code}"
-
-    max_len = 0
-    for e in o.Shape.Edges:
-        if e.Curve.__class__.__name__ == "Line":
-            L = e.Length
-            if 40 < L < 10000:
-                max_len = max(max_len, L)
-
-    if max_len == 0:
+    if L < MIN_LENGTH or L > MAX_LENGTH:
+        log(f"SKIP length out of range: {o.Name}  {L}")
         continue
 
-    L = int(round(max_len, 1))
+    material = get_material(o)
 
-    key = (material, L)
-    parts[key] = parts.get(key, 0) + 1
+    a1 = get_trim(o, "TrimAngle1")
+    a2 = get_trim(o, "TrimAngle2")
+    r2 = get_trim(o, "TrimRotate2")
 
-# ========== СОЗДАНИЕ ТАБЛИЦЫ ==========
+    log(f"DETAIL: {o.Name}  L={L}  A1={a1}  A2={a2}  R2={r2}")
 
-sheet = doc.addObject('Spreadsheet::Sheet','CutList')
+    key = canonical_key(L, material, a1, a2, r2)
+
+    if key not in items:
+        items[key] = {
+            "length": L,
+            "material": material,
+            "a1": a1,
+            "a2": a2,
+            "r2": r2,
+            "qty": 0
+        }
+
+    items[key]["qty"] += 1
+
+
+# ---------------- ТАБЛИЦА ----------------
+
+if "CutList" in DOC.Objects:
+    sheet = DOC.getObject("CutList")
+    sheet.clearAll()
+else:
+    sheet = DOC.addObject("Spreadsheet::Sheet", "CutList")
 
 row = 1
 
-# ---- Заголовок ----
-sheet.set(f"A{row}", "Материал")
-sheet.set(f"B{row}", "Длина (мм)")
-sheet.set(f"C{row}", "Кол-во")
-# место под будущее:
-sheet.set(f"D{row}", "Запил (TODO)")
-sheet.setBackground(f"A{row}:D{row}", COLOR_HEADER)
-sheet.setForeground(f"A{row}:D{row}", COLOR_TEXT)
+# ----- заголовок деталей
+
+headers = ["Материал", "Длина", "A1", "A2", "Rotate2", "Кол-во"]
+cols = ["A","B","C","D","E","F"]
+
+for c, h in zip(cols, headers):
+    sheet.set(c+str(row), h)
+    sheet.setBackground(c+str(row), COLOR_HEADER)
+    sheet.setForeground(c+str(row), TEXT_COLOR)
 
 row += 1
 
-# ---- Список деталей ----
-sorted_parts = sorted(parts.items(), key=lambda x: (x[0][0], -x[0][1]))
+sorted_items = sorted(items.values(),
+                      key=lambda x: (x["material"], x["length"]))
 
-for i, ((material, L), qty) in enumerate(sorted_parts):
-    sheet.set(f"A{row}", material)
-    sheet.set(f"B{row}", str(L))
-    sheet.set(f"C{row}", str(qty))
+zebra = False
+for it in sorted_items:
+    bg = COLOR_ROW_A if zebra else COLOR_ROW_B
+    zebra = not zebra
 
-    # тут позже можно будет добавить:
-    # - углы митра
-    # - плоскость реза
-    # - один/два торца
+    sheet.set("A"+str(row), it["material"])
+    sheet.set("B"+str(row), str(it["length"]))
+    sheet.set("C"+str(row), str(it["a1"]))
+    sheet.set("D"+str(row), str(it["a2"]))
+    sheet.set("E"+str(row), str(it["r2"]))
+    sheet.set("F"+str(row), str(it["qty"]))
 
-    bg = COLOR_ROW_A if i % 2 == 0 else COLOR_ROW_B
-    sheet.setBackground(f"A{row}:D{row}", bg)
-    sheet.setForeground(f"A{row}:D{row}", COLOR_TEXT)
+    for c in cols:
+        sheet.setBackground(c+str(row), bg)
+        sheet.setForeground(c+str(row), TEXT_COLOR)
 
     row += 1
 
+
+# ---------------- РАСКРОЙ ----------------
+
+row += 2
+sheet.set("A"+str(row), "РАСКРОЙ")
+sheet.setBackground("A"+str(row), COLOR_HEADER)
 row += 1
 
-# ========== РАСКРОЙ ПО МАТЕРИАЛАМ ==========
+materials = {}
 
-sheet.set(f"A{row}", "РАСКРОЙ ИЗ 3м ЗАГОТОВОК")
-sheet.setBackground(f"A{row}:D{row}", COLOR_HEADER)
-sheet.setForeground(f"A{row}:D{row}", COLOR_TEXT)
-row += 1
+for it in sorted_items:
+    mat = it["material"]
+    if mat not in materials:
+        materials[mat] = []
+    materials[mat] += [it["length"]] * it["qty"]
 
-# группировка по материалу
-by_material = {}
-for (material, L), qty in parts.items():
-    by_material.setdefault(material, []).extend([L]*qty)
+for mat, lengths in materials.items():
 
-for material, pieces in by_material.items():
-
-    sheet.set(f"A{row}", material)
-    sheet.setBackground(f"A{row}:D{row}", COLOR_HEADER)
+    sheet.set("A"+str(row), mat)
+    sheet.setBackground("A"+str(row), COLOR_HEADER)
     row += 1
 
-    pieces.sort(reverse=True)
+    stocks = pack_stock(lengths)
 
-    bars = []
+    hdr = ["Хлыст", "Деталь1", "Деталь2", "Деталь3", "Деталь4", "Деталь5", "Остаток"]
+    for i, h in enumerate(hdr):
+        col = chr(ord("A")+i)
+        sheet.set(col+str(row), h)
+        sheet.setBackground(col+str(row), COLOR_HEADER)
+        sheet.setForeground(col+str(row), TEXT_COLOR)
 
-    for p in pieces:
-        placed = False
+    row += 1
 
-        for b in bars:
-            used = sum(b) + KERF*(len(b))  # учёт пропилов
-            if used + p <= STOCK_LEN:
-                b.append(p)
-                placed = True
-                break
+    zebra = False
+    idx = 1
 
-        if not placed:
-            bars.append([p])
+    for s in stocks:
+        bg = COLOR_ROW_A if zebra else COLOR_ROW_B
+        zebra = not zebra
 
-    for i, b in enumerate(bars, 1):
-        sheet.set(f"A{row}", f"{MATERIAL_DEFAULT} {i}")
+        sheet.set("A"+str(row), str(idx))
 
-        used = sum(b) + KERF*(len(b)-1 if len(b)>0 else 0)
-        rest = STOCK_LEN - used
+        col_i = 1
+        for part in s:
+            col = chr(ord("A")+col_i)
+            sheet.set(col+str(row), str(part))
+            col_i += 1
 
-        sheet.set(f"B{row}", " + ".join(str(x) for x in b))
-        sheet.set(f"C{row}", f"Остаток: {round(rest,1)}")
+        used = sum(s) + KERF * (len(s)-1)
+        rest = round(STOCK_LENGTH - used, ROUND_TO)
 
-        bg = COLOR_ROW_A if i % 2 == 0 else COLOR_ROW_B
-        sheet.setBackground(f"A{row}:D{row}", bg)
+        sheet.set("G"+str(row), str(rest))
+
+        for i in range(7):
+            col = chr(ord("A")+i)
+            sheet.setBackground(col+str(row), bg)
+            sheet.setForeground(col+str(row), TEXT_COLOR)
+
         row += 1
+        idx += 1
 
-    row += 1
 
-doc.recompute()
+DOC.recompute()
+App.Console.PrintMessage("=== DONE ===\n")
