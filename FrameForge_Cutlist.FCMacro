@@ -64,9 +64,41 @@ def get_trim(obj, prop):
     return 0.0
 
 
-def canonical_key(length, material, a1, a2, r2):
-    k1 = (length, material, a1, a2, r2)
-    k2 = (length, material, a2, a1, (r2 + 180.0) % 360.0)
+def get_bevel_start(obj):
+    """Get bevel angle at start of profile"""
+    # Try combined bevel first
+    if hasattr(obj, "BevelStartCut"):
+        return get_trim(obj, "BevelStartCut")
+    # Try separate bevels
+    if hasattr(obj, "BevelStartCut1"):
+        return get_trim(obj, "BevelStartCut1")
+    return 0.0
+
+
+def get_bevel_end(obj):
+    """Get bevel angle at end of profile"""
+    # Try combined bevel first
+    if hasattr(obj, "BevelEndCut"):
+        return get_trim(obj, "BevelEndCut")
+    # Try separate bevels
+    if hasattr(obj, "BevelEndCut1"):
+        return get_trim(obj, "BevelEndCut1")
+    return 0.0
+
+
+def get_bevel_rotate(obj, end="Start"):
+    """Get bevel rotation angle"""
+    if end == "Start":
+        prop = "BevelStartRotate"
+    else:
+        prop = "BevelEndRotate"
+    return get_trim(obj, prop)
+
+
+def canonical_key(length, material, bevel_start, bevel_end, bevel_rotate):
+    """Create canonical key for grouping identical parts"""
+    k1 = (length, material, bevel_start, bevel_end, bevel_rotate)
+    k2 = (length, material, bevel_end, bevel_start, (bevel_rotate + 180.0) % 360.0)
     return min(str(k1), str(k2))
 
 
@@ -114,21 +146,21 @@ for o in DOC.Objects:
 
     material = get_material(o)
 
-    a1 = get_trim(o, "TrimAngle1")
-    a2 = get_trim(o, "TrimAngle2")
-    r2 = get_trim(o, "TrimRotate2")
+    bevel_start = get_bevel_start(o)
+    bevel_end = get_bevel_end(o)
+    bevel_rotate = get_bevel_rotate(o, "Start")
 
-    log(f"DETAIL: {o.Name}  L={L}  A1={a1}  A2={a2}  R2={r2}")
+    log(f"DETAIL: {o.Name}  L={L}  BevelStart={bevel_start}  BevelEnd={bevel_end}  Rotate={bevel_rotate}")
 
-    key = canonical_key(L, material, a1, a2, r2)
+    key = canonical_key(L, material, bevel_start, bevel_end, bevel_rotate)
 
     if key not in items:
         items[key] = {
             "length": L,
             "material": material,
-            "a1": a1,
-            "a2": a2,
-            "r2": r2,
+            "bevel_start": bevel_start,
+            "bevel_end": bevel_end,
+            "bevel_rotate": bevel_rotate,
             "qty": 0
         }
 
@@ -147,7 +179,7 @@ row = 1
 
 # ----- заголовок деталей
 
-headers = ["Материал", "Длина", "A1", "A2", "Rotate2", "Кол-во"]
+headers = ["Материал", "Длина", "BevelStart", "BevelEnd", "Rotate", "Кол-во"]
 cols = ["A","B","C","D","E","F"]
 
 for c, h in zip(cols, headers):
@@ -167,9 +199,9 @@ for it in sorted_items:
 
     sheet.set("A"+str(row), it["material"])
     sheet.set("B"+str(row), str(it["length"]))
-    sheet.set("C"+str(row), str(it["a1"]))
-    sheet.set("D"+str(row), str(it["a2"]))
-    sheet.set("E"+str(row), str(it["r2"]))
+    sheet.set("C"+str(row), str(it["bevel_start"]))
+    sheet.set("D"+str(row), str(it["bevel_end"]))
+    sheet.set("E"+str(row), str(it["bevel_rotate"]))
     sheet.set("F"+str(row), str(it["qty"]))
 
     for c in cols:
