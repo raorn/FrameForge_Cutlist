@@ -1,507 +1,256 @@
-# -*- mode: python; coding: utf-8 -*-
-# vim: ft=python
-
+# -*- coding: utf-8 -*-
 import FreeCAD as App
-import math
-import Part
+import FreeCADGui as Gui
+from PySide import QtGui, QtCore
+import re
+from collections import defaultdict, Counter
 
-DOC = App.ActiveDocument
+doc = App.ActiveDocument
 
-# ---------------- КОНСТАНТЫ ----------------
-
-DEFAULT_MATERIAL = "Профруба"
-
-STOCK_LENGTH = 3000.0
-KERF = 2.0
-
-ROUND_TO = 1          # 0.1 мм
-MIN_LENGTH = 10.0
-MAX_LENGTH = 6000.0
-
-COLOR_HEADER = (0.85, 0.85, 0.85)
-COLOR_ROW_A  = (0.96, 0.96, 0.96)
-COLOR_ROW_B  = (0.90, 0.90, 0.90)
-TEXT_COLOR   = (0.0, 0.0, 0.0)
-
-DEBUG = True
-
-
-# ---------------- УТИЛИТЫ ----------------
-
+# ----------------------------- ЛОГ -----------------------------
 def log(msg):
-    if DEBUG:
-        App.Console.PrintMessage(str(msg) + "\n")
+    App.Console.PrintMessage(str(msg) + "\n")
 
-
-def get_length(obj):
-    bb = obj.Shape.BoundBox
-    L = max(bb.XLength, bb.YLength, bb.ZLength)
-    return round(L, ROUND_TO)
-
-
-def get_profile_code(obj):
-    name = obj.Name
-    parts = name.split("_")
-    if len(parts) < 2:
-        return None
-    if parts[0] != "Profile":
-        return None
-    return parts[1]
-
-
-def get_material(obj):
-    code = get_profile_code(obj)
-    if not code:
-        return None
-    return f"{DEFAULT_MATERIAL} {code}"
-
-
-def is_trimmed_profile(obj):
-    """Check if object is a TrimmedProfile"""
-    if obj.TypeId == "Part::FeaturePython":
-        if hasattr(obj, "TrimmedBody") and hasattr(obj, "TrimmingBoundary"):
-            return True
-    return False
-
-
-def get_profile_from_trimmed(obj):
-    """Recursively get the base Profile from a TrimmedProfile chain"""
-    if hasattr(obj, "TrimmedBody"):
-        base = obj.TrimmedBody
-        if is_trimmed_profile(base):
-            return get_profile_from_trimmed(base)
-        else:
-            return base
-    return obj
-
-
-def get_all_cutting_angles(trimmed_profile):
-    """Вычислить все углы запилов из цепочки TrimmedProfile
-    
-    Логика: каждый объект в цепочке может быть подрезан с одного конца.
-    Собираем углы в правильном порядке (start к end).
+# ---------------------- ОПРЕДЕЛЕНИЕ ДЛИНЫ ----------------------
+def get_real_length(obj):
     """
-    angles = []
-
-    def resolve_edge(link):
-        try:
-            target = trimmed_profile.Proxy.getTarget(link)
-            edge_obj = DOC.getObject(target[0].Name)
-            return edge_obj.getSubObject(target[1][0])
-        except Exception as e:
-            log(f"      [ERROR] resolve_edge: {e}")
+    Реальная длина детали = максимальная длина ребра.
+    Это даёт фактическую длину профиля, а не толщину.
+    """
+    try:
+        edges = obj.Shape.Edges
+        if not edges:
             return None
-
-    try:
-        log(f"    [PROCESS] {trimmed_profile.Name}: Type={trimmed_profile.TrimmedProfileType}, CutType={trimmed_profile.CutType}")
-        edge = resolve_edge(trimmed_profile.TrimmedBody)
-        if edge is None:
-            log(f"      [FAIL] Could not resolve edge")
-            return []
-        
-        dir_vec = (edge.Vertexes[-1].Point.sub(edge.Vertexes[0].Point)).normalize()
-        angle_div = 2.0 if trimmed_profile.TrimmedProfileType == "End Miter" else 1.0
-        log(f"      angle_div={angle_div}")
-
-        current_angles = []
-        if trimmed_profile.TrimmedProfileType == "End Miter" or trimmed_profile.CutType == "Simple fit":
-            # Collect ALL plane faces from all TrimmingBoundary objects and analyze them
-            face_angles = []
-            for bound in trimmed_profile.TrimmingBoundary:
-                trim_obj = bound[0]
-                log(f"      → Analyzing all faces of {trim_obj.Name}")
-                
-                try:
-                    # Analyze ALL faces in the shape, not just the referenced ones
-                    if hasattr(trim_obj, 'Shape'):
-                        for face_idx, face in enumerate(trim_obj.Shape.Faces):
-                            try:
-                                if isinstance(face.Surface, Part.Plane):
-                                    normal = face.normalAt(0.5, 0.5).normalize()
-                                    angle_raw = math.degrees(dir_vec.getAngle(normal))
-                                    angle = angle_raw
-                                    
-                                    # Normalize angle to 0-90 range
-                                    if angle_raw > 90:
-                                        angle = 180 - angle_raw
-                                    
-                                    # Skip only truly parallel/perpendicular faces:
-                                    # 0° = parallel to edge, 180° = opposite end  
-                                    # 90° and 45° and 135° are all valid cutting planes!
-                                    if abs(angle_raw) < 5 or abs(angle_raw - 180) < 5:
-                                        log(f"        Face{face_idx}: raw_angle={angle_raw:.1f}° (skip parallel/perpendicular)")
-                                        continue
-                                    
-                                    angle_final = angle / angle_div
-                                    face_angles.append((f"{trim_obj.Name}.Face{face_idx}", angle_raw, angle_final))
-                                    log(f"        Face{face_idx}: raw_angle={angle_raw:.1f}° → div={angle_div} → final={angle_final:.1f}°")
-                            except Exception as e:
-                                pass
-                except Exception as e:
-                    log(f"      [ERROR] analyzing faces: {e}")
-            
-            # Pick the angle with maximum value (this is the cutting plane)
-            # For Trim: filter out walls (90° raw). For Miter: keep them (they become 45° final = valid)
-            if face_angles:
-                if angle_div > 1.0:
-                    # Miter: 90° raw is part of the cutting plane (becomes 45° final), keep it!
-                    real_angles = face_angles
-                else:
-                    # Trim: 90° raw is just wall geometry, filter it out
-                    real_angles = [a for a in face_angles if abs(a[1] - 90.0) > 1.0]
-                
-                if real_angles:
-                    # Use real cutting plane angles, prefer maximum
-                    selected = max(real_angles, key=lambda x: abs(x[2]))[2]
-                    current_angles.append(selected)
-                    if len(real_angles) > 1:
-                        log(f"      → Multiple cutting planes found, selected max: {selected:.1f}°")
-                else:
-                    # Only wall geometry angles (90° raw) found = perpendicular cut
-                    log(f"      → Found only wall faces (90° raw), treating as perpendicular cut = 0°")
-                    current_angles.append(0.0)
-            
-        else:
-            log(f"      → Type={trimmed_profile.TrimmedProfileType}, CutType={trimmed_profile.CutType} (skip)")
-
-        # Для текущего уровня: один конец подрезан (angle), другой идёт к parent
-        # Логика: если есть запил, то это конец цепочки (end или start в зависимости от уровня)
-        if current_angles:
-            # Это подрезка текущего объекта
-            angles.extend(current_angles)
-
-        # Рекурсивно собираем углы из parent
-        if hasattr(trimmed_profile.TrimmedBody, "TrimmedProfileType"):
-            parent_profile = trimmed_profile.TrimmedBody
-            log(f"      → parent: {parent_profile.Name}")
-            parent_angles = get_all_cutting_angles(parent_profile)
-            angles.extend(parent_angles)
-
-    except Exception as e:
-        log(f"    [ERROR] get_all_cutting_angles: {e}")
-
-    return angles
-
-
-def get_trimmed_profile_angles(trimmed_obj):
-    """Извлечь углы из TrimmedProfile цепочки и упорядочить их"""
-    try:
-        log(f"  [CALC-ANGLES] {trimmed_obj.Name}")
-        all_angles = get_all_cutting_angles(trimmed_obj)
-        
-        angles_str = " + ".join([f'{a:.1f}°' for a in all_angles])
-        log(f"    → Collected angles ({len(all_angles)}): {angles_str}")
-        
-        if len(all_angles) == 0:
-            log(f"    → Result: (0.0, 0.0) [no angles]")
-            return 0.0, 0.0
-        elif len(all_angles) == 1:
-            # Один запил - это либо start, либо end
-            # По умолчанию считаем это end (самый видимый объект подрезается)
-            result = (0.0, float(all_angles[0]))
-            log(f"    → Result: {result} [single angle → end]")
-            return result
-        else:
-            # Несколько запилов в цепочке
-            # first из цепочки (базовый профиль) -> start
-            # last из цепочки (видимая деталь) -> end
-            # ОБРАТНЫЙ ПОРЯДОК: all_angles[0] - из ВИДИМОГО объекта (end)
-            #                   all_angles[-1] - из БАЗОВОГО объекта (start)
-            # Нужно развернуть!
-            reversed_angles = list(reversed(all_angles))
-            result = (float(reversed_angles[0]), float(reversed_angles[-1]))
-            log(f"    → Reversed: {[f'{a:.1f}' for a in reversed_angles]}")
-            log(f"    → Result: {result}")
-            return result
-    except Exception as e:
-        log(f"  [ERROR] get_trimmed_profile_angles: {e}")
-        return 0.0, 0.0
-
-
-def get_cutting_operation(bevel_start, bevel_end):
-    """
-    Определить тип операции пиления на ленточной пиле.
-    Лентопила может пилить под углом 0-45°.
-    
-    Если углы "противоположные" (один с одной стороны, другой с противоположной в 3D смысле),
-    то это одна операция с поворотом 180°.
-    """
-    start_abs = abs(bevel_start)
-    end_abs = abs(bevel_end)
-    
-    # Оба конца без скоса
-    if start_abs < 0.1 and end_abs < 0.1:
-        return "0 | 0"
-    
-    # Проверить, зеркальные ли углы (одинаковые по модулю, но противоположные по физической геометрии)
-    # Например: "22.5|0" и "0|22.5" - это один результат с разными ориентациями
-    # Или: "45|45" - оба конца под 45° в одной плоскости (параллельные)
-    #      "45|45 ↻180°" - оба конца под 45° но в разных плоскостях (перпендикулярные)
-    
-    # Пока используем простую логику: если углы в обратном порядке - это поворот
-    if abs(start_abs - end_abs) < 0.1:  # Углы примерно равны
-        # start == end: оба конца скошены одинаково
-        return f"{start_abs:.1f} | {end_abs:.1f}"
-    else:
-        # start != end: разные углы на разных концах
-        return f"{start_abs:.1f} | {end_abs:.1f}"
-
-
-def normalize_operation(operation):
-    """
-    Нормализовать операцию пиления для группировки.
-    
-    Правила:
-    - Если оба углы = 0, нет поворота
-    - Если один = 0, нет поворота (пила не может одновременно пилить и прямо)
-    - Если оба ненулевые: всегда добавляем ↻180° (в этом документе это означает разные плоскости)
-    """
-    parts = operation.split(" | ")
-    if len(parts) != 2:
-        return operation
-    
-    angle1_str = parts[0].strip()
-    angle2_part = parts[1].strip()
-    
-    # Проверить, есть ли поворот в конце
-    has_rotation = "↻" in angle2_part
-    angle2_str = angle2_part.replace(" ↻180°", "").strip()
-    
-    try:
-        angle1 = float(angle1_str)
-        angle2 = float(angle2_str.split()[0])  # взять только число
-        
-        # Если оба нуля - нет поворота
-        if angle1 == 0 and angle2 == 0:
-            result = "0 | 0"
-        # Если один из них = 0, то поворот = 0
-        elif angle1 == 0 or angle2 == 0:
-            # Просто прямое расположение, без поворота, нормализуем (меньший первым)
-            if angle1 > angle2:
-                angle1, angle2 = angle2, angle1
-            result = f"{angle1:.1f} | {angle2:.1f}"
-        
-        # Оба ненулевые - в этом документе ВСЕГДА добавляем поворот 180°
-        else:
-            # Нормализуем (меньший первым) + поворот
-            if angle1 > angle2:
-                angle1, angle2 = angle2, angle1
-            result = f"{angle1:.1f} | {angle2:.1f} ↻180°"
-        
-        if result != operation:
-            log(f"      [NORMALIZE] {operation} → {result}")
-        return result
+        return max(e.Length for e in edges)
     except:
-        return operation
+        return None
 
+# ---------------------- СБОР ПРОФИЛЕЙ --------------------------
+def collect_profiles(name_pattern):
+    regex = re.compile(name_pattern)
+    profiles = defaultdict(list)
 
-def canonical_key(length, material, operation):
-    """Create canonical key for grouping identical parts by operation"""
-    # Детали с одинаковой длиной, материалом и операцией пиления считаются идентичными
-    # ВАЖНО: маркер поворота ↻180° - часть операции и ДОЛЖЕН учитываться!
-    # "45 | 45 ↻180°" и "45 | 45" - разные операции (плоскости перпендикулярны vs параллельны)
-    return (length, material, operation)
+    for obj in doc.Objects:
+        if not getattr(obj.ViewObject, "Visibility", False):
+            continue
 
+        if not regex.match(obj.Name):
+            continue
 
-def pack_stock(lengths):
+        parts = obj.Name.split("_")
+        if len(parts) < 2:
+            continue
+
+        profile_type = parts[1]
+        length = get_real_length(obj)
+
+        if length:
+            profiles[profile_type].append(length)
+
+    return profiles
+
+# --------------------------- ДИАЛОГ ----------------------------
+class ParamDialog(QtGui.QDialog):
+    def __init__(self, profile_types):
+        super(ParamDialog, self).__init__()
+        self.setWindowTitle("Cut parameters")
+        self.resize(450, 350)
+
+        layout = QtGui.QVBoxLayout(self)
+
+        form = QtGui.QFormLayout()
+
+        self.kerf = QtGui.QDoubleSpinBox()
+        self.kerf.setSuffix(" mm")
+        self.kerf.setDecimals(2)
+        self.kerf.setMaximum(50)
+        self.kerf.setValue(2.0)
+        form.addRow("Cut tolerance:", self.kerf)
+
+        layout.addLayout(form)
+
+        self.stock_boxes = {}
+        self.scrap_boxes = {}
+
+        scroll = QtGui.QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QtGui.QWidget()
+        inner_layout = QtGui.QFormLayout(inner)
+
+        for p in sorted(profile_types):
+            stock = QtGui.QDoubleSpinBox()
+            stock.setSuffix(" mm")
+            stock.setDecimals(0)
+            stock.setMaximum(100000)
+            stock.setSingleStep(100)
+            stock.setValue(3000)
+
+            scrap = QtGui.QLineEdit()
+            scrap.setPlaceholderText("eg.: 800,1200,450")
+
+            self.stock_boxes[p] = stock
+            self.scrap_boxes[p] = scrap
+
+            inner_layout.addRow(f"{p} — profile length:", stock)
+            inner_layout.addRow(f"{p} — leftovers:", scrap)
+
+        scroll.setWidget(inner)
+        layout.addWidget(scroll)
+
+        buttons = QtGui.QDialogButtonBox(
+            QtGui.QDialogButtonBox.Ok | QtGui.QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_values(self):
+        stock = {}
+        scraps = {}
+
+        for p in self.stock_boxes:
+            stock[p] = self.stock_boxes[p].value()
+
+            txt = self.scrap_boxes[p].text().strip()
+            if txt:
+                scraps[p] = [float(x) for x in txt.split(",") if x.strip()]
+            else:
+                scraps[p] = []
+
+        return (
+            self.kerf.value(),
+            stock,
+            scraps
+        )
+
+# ---------------------- РАСКРОЙ -----------------------
+def cut_plan(lengths, stock_len, scraps, kerf):
     lengths = sorted(lengths, reverse=True)
-    stocks = []
 
-    for L in lengths:
-        placed = False
-        for stock in stocks:
-            used = sum(stock) + KERF * (len(stock))
-            if used + L <= STOCK_LENGTH:
-                stock.append(L)
-                placed = True
-                break
-        if not placed:
-            stocks.append([L])
+    bins = list(scraps)
+    plans = [[] for _ in scraps]
+    factory_used = 0
 
-    return stocks
+    def try_place(piece):
+        for i in range(len(bins)):
+            used_len = sum(plans[i]) + kerf * max(0, len(plans[i]))
+            if bins[i] - used_len >= piece:
+                plans[i].append(piece)
+                return True
+        return False
 
+    for piece in lengths:
+        if try_place(piece):
+            continue
 
-# ---------------- СБОР ДЕТАЛЕЙ ----------------
+        bins.append(stock_len)
+        plans.append([piece])
+        factory_used += 1
 
-items = {}
+    return plans, factory_used
 
-for o in DOC.Objects:
-
-    if not hasattr(o, "Shape"):
-        continue
-    if not o.Visibility:
-        continue
-
-    # Получить код профиля
-    code = get_profile_code(o)
-    if not code:
-        continue
-
-    # Попытаться получить длину
-    try:
-        L = get_length(o)
-    except:
-        continue
-
-    if L < MIN_LENGTH or L > MAX_LENGTH:
-        log(f"SKIP length out of range: {o.Name}  {L}")
-        continue
-
-    # Определить тип: TrimmedProfile или базовый Profile
-    if is_trimmed_profile(o):
-        # TrimmedProfile - вычислить углы из геометрии подрезок
-        base_profile = get_profile_from_trimmed(o)
-        material = get_material(base_profile)
-        bevel_start, bevel_end = get_trimmed_profile_angles(o)
-        operation_type = "подрезанная"
-    else:
-        # Базовый Profile - прямые спилы
-        material = get_material(o)
-        bevel_start = 0.0
-        bevel_end = 0.0
-        operation_type = "базовая"
-
-    bevel_rotate = 0.0
-    operation = get_cutting_operation(bevel_start, bevel_end)
-    operation_normalized = normalize_operation(operation)
-
-    log(f"{operation_type.upper():12} {o.Name:20} | L={L:7.1f} | angles=({bevel_start:5.1f}, {bevel_end:5.1f}) | op={operation:15} → norm={operation_normalized:20}")
-
-    key = canonical_key(L, material, operation_normalized)
-
-    if key not in items:
-        items[key] = {
-            "length": L,
-            "material": material,
-            "bevel_start": bevel_start,
-            "bevel_end": bevel_end,
-            "bevel_rotate": bevel_rotate,
-            "operation": operation_normalized,
-            "qty": 0,
-            "names": []
-        }
-
-    items[key]["qty"] += 1
-    items[key]["names"].append(o.Name)
-    log(f"  [GROUP] key=({L}, '{material}', '{operation_normalized}') qty now={items[key]['qty']}")
+# ---------------------- СТИЛИ --------------------------
+HEADER_BG = (0.85, 0.85, 0.85)
+ROW_BG_1 = (0.90, 0.90, 0.90)
+ROW_BG_2 = (0.95, 0.95, 0.95)
 
 
-# ---------------- ТАБЛИЦА ----------------
+def set_bg(sheet, cell, color_tuple):
+    sheet.setBackground(cell, color_tuple)
 
-if "CutList" in DOC.Objects:
-    sheet = DOC.getObject("CutList")
-    sheet.clearAll()
-else:
-    sheet = DOC.addObject("Spreadsheet::Sheet", "CutList")
+# ---------------------- СПРЕДШИТЫ ------------------------------
+def make_summary_sheet(summary):
+    sheet = doc.addObject("Spreadsheet::Sheet", "CutList")
 
-row = 1
+    headers = ["Profile type", "Length", "Amount"]
+    for col, h in zip("ABC", headers):
+        sheet.set(f"{col}1", h)
+        set_bg(sheet, f"{col}1", HEADER_BG)
 
-# ----- заголовок деталей
+    row = 2
+    stripe = False
 
-headers = ["Материал", "Длина", "Операция пиления", "Кол-во"]
-cols = ["A","B","C","D"]
+    for p, data in summary.items():
+        for length, qty in sorted(data["count"].items()):
+            sheet.set(f"A{row}", p)
+            sheet.set(f"B{row}", f"{length:.1f}")
+            sheet.set(f"C{row}", str(qty))
 
-for c, h in zip(cols, headers):
-    sheet.set(c+str(row), h)
-    sheet.setBackground(c+str(row), COLOR_HEADER)
-    sheet.setForeground(c+str(row), TEXT_COLOR)
+            bg = ROW_BG_1 if stripe else ROW_BG_2
+            for col in "ABC":
+                set_bg(sheet, f"{col}{row}", bg)
 
-row += 1
-
-sorted_items = sorted(items.values(),
-                      key=lambda x: (x["material"], x["length"]))
-
-log("\n" + "="*120)
-log("TABLE OUTPUT:")
-log("="*120)
-log(f"{'#':3} | {'Материал':20} | {'Длина':8} | {'Операция пиления':25} | {'Кол-во':5} | Names")
-log("-"*120)
-
-row_num = 0
-zebra = False
-for it in sorted_items:
-    row_num += 1
-    names_str = ", ".join(it["names"])
-    log(f"{row_num:3} | {it['material']:20} | {it['length']:8.1f} | {it['operation']:25} | {it['qty']:5} | {names_str}")
-    bg = COLOR_ROW_A if zebra else COLOR_ROW_B
-    zebra = not zebra
-
-    sheet.set("A"+str(row), it["material"])
-    sheet.set("B"+str(row), str(it["length"]))
-    sheet.set("C"+str(row), str(it["operation"]))
-    sheet.set("D"+str(row), str(it["qty"]))
-
-    for c in cols:
-        sheet.setBackground(c+str(row), bg)
-        sheet.setForeground(c+str(row), TEXT_COLOR)
-
-    row += 1
-
-log("-"*120)
-log(f"Total rows: {row_num}")
-log("="*120)
-
-
-# ---------------- РАСКРОЙ ----------------
-
-row += 2
-sheet.set("A"+str(row), "РАСКРОЙ")
-sheet.setBackground("A"+str(row), COLOR_HEADER)
-row += 1
-
-materials = {}
-
-for it in sorted_items:
-    mat = it["material"]
-    if mat not in materials:
-        materials[mat] = []
-    materials[mat] += [it["length"]] * it["qty"]
-
-for mat, lengths in materials.items():
-
-    sheet.set("A"+str(row), mat)
-    sheet.setBackground("A"+str(row), COLOR_HEADER)
-    row += 1
-
-    stocks = pack_stock(lengths)
-
-    hdr = ["Хлыст", "Деталь1", "Деталь2", "Деталь3", "Деталь4", "Деталь5", "Остаток"]
-    for i, h in enumerate(hdr):
-        col = chr(ord("A")+i)
-        sheet.set(col+str(row), h)
-        sheet.setBackground(col+str(row), COLOR_HEADER)
-        sheet.setForeground(col+str(row), TEXT_COLOR)
-
-    row += 1
-
-    zebra = False
-    idx = 1
-
-    for s in stocks:
-        bg = COLOR_ROW_A if zebra else COLOR_ROW_B
-        zebra = not zebra
-
-        sheet.set("A"+str(row), str(idx))
-
-        col_i = 1
-        for part in s:
-            col = chr(ord("A")+col_i)
-            sheet.set(col+str(row), str(part))
-            col_i += 1
-
-        used = sum(s) + KERF * (len(s)-1)
-        rest = round(STOCK_LENGTH - used, ROUND_TO)
-
-        sheet.set("G"+str(row), str(rest))
-
-        for i in range(7):
-            col = chr(ord("A")+i)
-            sheet.setBackground(col+str(row), bg)
-            sheet.setForeground(col+str(row), TEXT_COLOR)
-
+            stripe = not stripe
+            row += 1
+            
         row += 1
-        idx += 1
+        sheet.set(f"A{row}", f"Total profiles {p}")
+        sheet.set(f"B{row}", str(data["stock"]))
+        bg = ROW_BG_1 if stripe else ROW_BG_2
+        for col in "AB":
+            set_bg(sheet, f"{col}{row}", bg)
+        
+        stripe = not stripe
+        row += 1
 
+def make_detail_sheet(profile, stock_len, plans, kerf):
+    sheet = doc.addObject("Spreadsheet::Sheet", f"CutDetails_{profile}")
 
-DOC.recompute()
-App.Console.PrintMessage("=== DONE ===\n")
+    row = 1
+    bar_index = 1
+
+    for plan in plans:
+        sheet.set(f"A{row}", f"Profile {bar_index} {profile}")
+        sheet.set(f"B{row}", f"{stock_len:.0f}")
+        set_bg(sheet, f"A{row}", HEADER_BG)
+        set_bg(sheet, f"B{row}", HEADER_BG)
+        row += 1
+
+        stripe = False
+        for idx, piece in enumerate(plan, 1):
+            sheet.set(f"A{row}", str(idx))
+            sheet.set(f"B{row}", f"{piece:.1f}")
+
+            bg = ROW_BG_1 if stripe else ROW_BG_2
+            set_bg(sheet, f"A{row}", bg)
+            set_bg(sheet, f"B{row}", bg)
+
+            stripe = not stripe
+            row += 1
+
+        total = sum(plan) + kerf * max(0, len(plan) - 1)
+        leftover = stock_len - total
+
+        sheet.set(f"A{row}", "Leftover")
+        sheet.set(f"B{row}", f"{leftover:.1f}")
+        set_bg(sheet, f"A{row}", HEADER_BG)
+        set_bg(sheet, f"B{row}", HEADER_BG)
+
+        row += 2
+        bar_index += 1
+
+# --------------------------- MAIN -------------------------------
+profiles = collect_profiles(r"Profile_.*")
+
+if not profiles:
+    log("Profiles not found")
+else:
+    dlg = ParamDialog(profiles.keys())
+    if dlg.exec():
+        kerf, stock_len, scraps = dlg.get_values()
+
+        summary = {}
+
+        for p, lengths in profiles.items():
+            plans, used = cut_plan(lengths, stock_len[p], scraps[p], kerf)
+
+            summary[p] = {
+                "count": Counter(round(l, 1) for l in lengths),
+                "stock": used
+            }
+
+            make_detail_sheet(p, stock_len[p], plans, kerf)
+
+        make_summary_sheet(summary)
+        doc.recompute()
+        log("Done.")
