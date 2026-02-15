@@ -1,6 +1,9 @@
+# -*- mode: python; coding: utf-8 -*-
 # vim: ft=python
 
 import FreeCAD as App
+import math
+import Part
 
 DOC = App.ActiveDocument
 
@@ -53,53 +56,251 @@ def get_material(obj):
     return f"{DEFAULT_MATERIAL} {code}"
 
 
-def get_trim(obj, prop):
-    if hasattr(obj, prop):
+def is_trimmed_profile(obj):
+    """Check if object is a TrimmedProfile"""
+    if obj.TypeId == "Part::FeaturePython":
+        if hasattr(obj, "TrimmedBody") and hasattr(obj, "TrimmingBoundary"):
+            return True
+    return False
+
+
+def get_profile_from_trimmed(obj):
+    """Recursively get the base Profile from a TrimmedProfile chain"""
+    if hasattr(obj, "TrimmedBody"):
+        base = obj.TrimmedBody
+        if is_trimmed_profile(base):
+            return get_profile_from_trimmed(base)
+        else:
+            return base
+    return obj
+
+
+def get_all_cutting_angles(trimmed_profile):
+    """Вычислить все углы запилов из цепочки TrimmedProfile
+    
+    Логика: каждый объект в цепочке может быть подрезан с одного конца.
+    Собираем углы в правильном порядке (start к end).
+    """
+    angles = []
+
+    def resolve_edge(link):
         try:
-            v = getattr(obj, prop)
-            log(f"{obj.Name}  {prop} = {v}")
-            return float(v)
-        except:
-            pass
-    return 0.0
+            target = trimmed_profile.Proxy.getTarget(link)
+            edge_obj = DOC.getObject(target[0].Name)
+            return edge_obj.getSubObject(target[1][0])
+        except Exception as e:
+            log(f"      [ERROR] resolve_edge: {e}")
+            return None
+
+    try:
+        log(f"    [PROCESS] {trimmed_profile.Name}: Type={trimmed_profile.TrimmedProfileType}, CutType={trimmed_profile.CutType}")
+        edge = resolve_edge(trimmed_profile.TrimmedBody)
+        if edge is None:
+            log(f"      [FAIL] Could not resolve edge")
+            return []
+        
+        dir_vec = (edge.Vertexes[-1].Point.sub(edge.Vertexes[0].Point)).normalize()
+        angle_div = 2.0 if trimmed_profile.TrimmedProfileType == "End Miter" else 1.0
+        log(f"      angle_div={angle_div}")
+
+        current_angles = []
+        if trimmed_profile.TrimmedProfileType == "End Miter" or trimmed_profile.CutType == "Simple fit":
+            # Collect ALL plane faces from all TrimmingBoundary objects and analyze them
+            face_angles = []
+            for bound in trimmed_profile.TrimmingBoundary:
+                trim_obj = bound[0]
+                log(f"      → Analyzing all faces of {trim_obj.Name}")
+                
+                try:
+                    # Analyze ALL faces in the shape, not just the referenced ones
+                    if hasattr(trim_obj, 'Shape'):
+                        for face_idx, face in enumerate(trim_obj.Shape.Faces):
+                            try:
+                                if isinstance(face.Surface, Part.Plane):
+                                    normal = face.normalAt(0.5, 0.5).normalize()
+                                    angle_raw = math.degrees(dir_vec.getAngle(normal))
+                                    angle = angle_raw
+                                    
+                                    # Normalize angle to 0-90 range
+                                    if angle_raw > 90:
+                                        angle = 180 - angle_raw
+                                    
+                                    # Skip only truly parallel/perpendicular faces:
+                                    # 0° = parallel to edge, 180° = opposite end  
+                                    # 90° and 45° and 135° are all valid cutting planes!
+                                    if abs(angle_raw) < 5 or abs(angle_raw - 180) < 5:
+                                        log(f"        Face{face_idx}: raw_angle={angle_raw:.1f}° (skip parallel/perpendicular)")
+                                        continue
+                                    
+                                    angle_final = angle / angle_div
+                                    face_angles.append((f"{trim_obj.Name}.Face{face_idx}", angle_raw, angle_final))
+                                    log(f"        Face{face_idx}: raw_angle={angle_raw:.1f}° → div={angle_div} → final={angle_final:.1f}°")
+                            except Exception as e:
+                                pass
+                except Exception as e:
+                    log(f"      [ERROR] analyzing faces: {e}")
+            
+            # Pick the angle with maximum value (this is the cutting plane)
+            # For Trim: filter out walls (90° raw). For Miter: keep them (they become 45° final = valid)
+            if face_angles:
+                if angle_div > 1.0:
+                    # Miter: 90° raw is part of the cutting plane (becomes 45° final), keep it!
+                    real_angles = face_angles
+                else:
+                    # Trim: 90° raw is just wall geometry, filter it out
+                    real_angles = [a for a in face_angles if abs(a[1] - 90.0) > 1.0]
+                
+                if real_angles:
+                    # Use real cutting plane angles, prefer maximum
+                    selected = max(real_angles, key=lambda x: abs(x[2]))[2]
+                    current_angles.append(selected)
+                    if len(real_angles) > 1:
+                        log(f"      → Multiple cutting planes found, selected max: {selected:.1f}°")
+                else:
+                    # Only wall geometry angles (90° raw) found = perpendicular cut
+                    log(f"      → Found only wall faces (90° raw), treating as perpendicular cut = 0°")
+                    current_angles.append(0.0)
+            
+        else:
+            log(f"      → Type={trimmed_profile.TrimmedProfileType}, CutType={trimmed_profile.CutType} (skip)")
+
+        # Для текущего уровня: один конец подрезан (angle), другой идёт к parent
+        # Логика: если есть запил, то это конец цепочки (end или start в зависимости от уровня)
+        if current_angles:
+            # Это подрезка текущего объекта
+            angles.extend(current_angles)
+
+        # Рекурсивно собираем углы из parent
+        if hasattr(trimmed_profile.TrimmedBody, "TrimmedProfileType"):
+            parent_profile = trimmed_profile.TrimmedBody
+            log(f"      → parent: {parent_profile.Name}")
+            parent_angles = get_all_cutting_angles(parent_profile)
+            angles.extend(parent_angles)
+
+    except Exception as e:
+        log(f"    [ERROR] get_all_cutting_angles: {e}")
+
+    return angles
 
 
-def get_bevel_start(obj):
-    """Get bevel angle at start of profile"""
-    # Try combined bevel first
-    if hasattr(obj, "BevelStartCut"):
-        return get_trim(obj, "BevelStartCut")
-    # Try separate bevels
-    if hasattr(obj, "BevelStartCut1"):
-        return get_trim(obj, "BevelStartCut1")
-    return 0.0
+def get_trimmed_profile_angles(trimmed_obj):
+    """Извлечь углы из TrimmedProfile цепочки и упорядочить их"""
+    try:
+        log(f"  [CALC-ANGLES] {trimmed_obj.Name}")
+        all_angles = get_all_cutting_angles(trimmed_obj)
+        
+        angles_str = " + ".join([f'{a:.1f}°' for a in all_angles])
+        log(f"    → Collected angles ({len(all_angles)}): {angles_str}")
+        
+        if len(all_angles) == 0:
+            log(f"    → Result: (0.0, 0.0) [no angles]")
+            return 0.0, 0.0
+        elif len(all_angles) == 1:
+            # Один запил - это либо start, либо end
+            # По умолчанию считаем это end (самый видимый объект подрезается)
+            result = (0.0, float(all_angles[0]))
+            log(f"    → Result: {result} [single angle → end]")
+            return result
+        else:
+            # Несколько запилов в цепочке
+            # first из цепочки (базовый профиль) -> start
+            # last из цепочки (видимая деталь) -> end
+            # ОБРАТНЫЙ ПОРЯДОК: all_angles[0] - из ВИДИМОГО объекта (end)
+            #                   all_angles[-1] - из БАЗОВОГО объекта (start)
+            # Нужно развернуть!
+            reversed_angles = list(reversed(all_angles))
+            result = (float(reversed_angles[0]), float(reversed_angles[-1]))
+            log(f"    → Reversed: {[f'{a:.1f}' for a in reversed_angles]}")
+            log(f"    → Result: {result}")
+            return result
+    except Exception as e:
+        log(f"  [ERROR] get_trimmed_profile_angles: {e}")
+        return 0.0, 0.0
 
 
-def get_bevel_end(obj):
-    """Get bevel angle at end of profile"""
-    # Try combined bevel first
-    if hasattr(obj, "BevelEndCut"):
-        return get_trim(obj, "BevelEndCut")
-    # Try separate bevels
-    if hasattr(obj, "BevelEndCut1"):
-        return get_trim(obj, "BevelEndCut1")
-    return 0.0
-
-
-def get_bevel_rotate(obj, end="Start"):
-    """Get bevel rotation angle"""
-    if end == "Start":
-        prop = "BevelStartRotate"
+def get_cutting_operation(bevel_start, bevel_end):
+    """
+    Определить тип операции пиления на ленточной пиле.
+    Лентопила может пилить под углом 0-45°.
+    
+    Если углы "противоположные" (один с одной стороны, другой с противоположной в 3D смысле),
+    то это одна операция с поворотом 180°.
+    """
+    start_abs = abs(bevel_start)
+    end_abs = abs(bevel_end)
+    
+    # Оба конца без скоса
+    if start_abs < 0.1 and end_abs < 0.1:
+        return "0 | 0"
+    
+    # Проверить, зеркальные ли углы (одинаковые по модулю, но противоположные по физической геометрии)
+    # Например: "22.5|0" и "0|22.5" - это один результат с разными ориентациями
+    # Или: "45|45" - оба конца под 45° в одной плоскости (параллельные)
+    #      "45|45 ↻180°" - оба конца под 45° но в разных плоскостях (перпендикулярные)
+    
+    # Пока используем простую логику: если углы в обратном порядке - это поворот
+    if abs(start_abs - end_abs) < 0.1:  # Углы примерно равны
+        # start == end: оба конца скошены одинаково
+        return f"{start_abs:.1f} | {end_abs:.1f}"
     else:
-        prop = "BevelEndRotate"
-    return get_trim(obj, prop)
+        # start != end: разные углы на разных концах
+        return f"{start_abs:.1f} | {end_abs:.1f}"
 
 
-def canonical_key(length, material, bevel_start, bevel_end, bevel_rotate):
-    """Create canonical key for grouping identical parts"""
-    k1 = (length, material, bevel_start, bevel_end, bevel_rotate)
-    k2 = (length, material, bevel_end, bevel_start, (bevel_rotate + 180.0) % 360.0)
-    return min(str(k1), str(k2))
+def normalize_operation(operation):
+    """
+    Нормализовать операцию пиления для группировки.
+    
+    Правила:
+    - Если оба углы = 0, нет поворота
+    - Если один = 0, нет поворота (пила не может одновременно пилить и прямо)
+    - Если оба ненулевые: всегда добавляем ↻180° (в этом документе это означает разные плоскости)
+    """
+    parts = operation.split(" | ")
+    if len(parts) != 2:
+        return operation
+    
+    angle1_str = parts[0].strip()
+    angle2_part = parts[1].strip()
+    
+    # Проверить, есть ли поворот в конце
+    has_rotation = "↻" in angle2_part
+    angle2_str = angle2_part.replace(" ↻180°", "").strip()
+    
+    try:
+        angle1 = float(angle1_str)
+        angle2 = float(angle2_str.split()[0])  # взять только число
+        
+        # Если оба нуля - нет поворота
+        if angle1 == 0 and angle2 == 0:
+            result = "0 | 0"
+        # Если один из них = 0, то поворот = 0
+        elif angle1 == 0 or angle2 == 0:
+            # Просто прямое расположение, без поворота, нормализуем (меньший первым)
+            if angle1 > angle2:
+                angle1, angle2 = angle2, angle1
+            result = f"{angle1:.1f} | {angle2:.1f}"
+        
+        # Оба ненулевые - в этом документе ВСЕГДА добавляем поворот 180°
+        else:
+            # Нормализуем (меньший первым) + поворот
+            if angle1 > angle2:
+                angle1, angle2 = angle2, angle1
+            result = f"{angle1:.1f} | {angle2:.1f} ↻180°"
+        
+        if result != operation:
+            log(f"      [NORMALIZE] {operation} → {result}")
+        return result
+    except:
+        return operation
+
+
+def canonical_key(length, material, operation):
+    """Create canonical key for grouping identical parts by operation"""
+    # Детали с одинаковой длиной, материалом и операцией пиления считаются идентичными
+    # ВАЖНО: маркер поворота ↻180° - часть операции и ДОЛЖЕН учитываться!
+    # "45 | 45 ↻180°" и "45 | 45" - разные операции (плоскости перпендикулярны vs параллельны)
+    return (length, material, operation)
 
 
 def pack_stock(lengths):
@@ -131,10 +332,12 @@ for o in DOC.Objects:
     if not o.Visibility:
         continue
 
+    # Получить код профиля
     code = get_profile_code(o)
     if not code:
         continue
 
+    # Попытаться получить длину
     try:
         L = get_length(o)
     except:
@@ -144,15 +347,27 @@ for o in DOC.Objects:
         log(f"SKIP length out of range: {o.Name}  {L}")
         continue
 
-    material = get_material(o)
+    # Определить тип: TrimmedProfile или базовый Profile
+    if is_trimmed_profile(o):
+        # TrimmedProfile - вычислить углы из геометрии подрезок
+        base_profile = get_profile_from_trimmed(o)
+        material = get_material(base_profile)
+        bevel_start, bevel_end = get_trimmed_profile_angles(o)
+        operation_type = "подрезанная"
+    else:
+        # Базовый Profile - прямые спилы
+        material = get_material(o)
+        bevel_start = 0.0
+        bevel_end = 0.0
+        operation_type = "базовая"
 
-    bevel_start = get_bevel_start(o)
-    bevel_end = get_bevel_end(o)
-    bevel_rotate = get_bevel_rotate(o, "Start")
+    bevel_rotate = 0.0
+    operation = get_cutting_operation(bevel_start, bevel_end)
+    operation_normalized = normalize_operation(operation)
 
-    log(f"DETAIL: {o.Name}  L={L}  BevelStart={bevel_start}  BevelEnd={bevel_end}  Rotate={bevel_rotate}")
+    log(f"{operation_type.upper():12} {o.Name:20} | L={L:7.1f} | angles=({bevel_start:5.1f}, {bevel_end:5.1f}) | op={operation:15} → norm={operation_normalized:20}")
 
-    key = canonical_key(L, material, bevel_start, bevel_end, bevel_rotate)
+    key = canonical_key(L, material, operation_normalized)
 
     if key not in items:
         items[key] = {
@@ -161,10 +376,14 @@ for o in DOC.Objects:
             "bevel_start": bevel_start,
             "bevel_end": bevel_end,
             "bevel_rotate": bevel_rotate,
-            "qty": 0
+            "operation": operation_normalized,
+            "qty": 0,
+            "names": []
         }
 
     items[key]["qty"] += 1
+    items[key]["names"].append(o.Name)
+    log(f"  [GROUP] key=({L}, '{material}', '{operation_normalized}') qty now={items[key]['qty']}")
 
 
 # ---------------- ТАБЛИЦА ----------------
@@ -179,8 +398,8 @@ row = 1
 
 # ----- заголовок деталей
 
-headers = ["Материал", "Длина", "BevelStart", "BevelEnd", "Rotate", "Кол-во"]
-cols = ["A","B","C","D","E","F"]
+headers = ["Материал", "Длина", "Операция пиления", "Кол-во"]
+cols = ["A","B","C","D"]
 
 for c, h in zip(cols, headers):
     sheet.set(c+str(row), h)
@@ -192,23 +411,35 @@ row += 1
 sorted_items = sorted(items.values(),
                       key=lambda x: (x["material"], x["length"]))
 
+log("\n" + "="*120)
+log("TABLE OUTPUT:")
+log("="*120)
+log(f"{'#':3} | {'Материал':20} | {'Длина':8} | {'Операция пиления':25} | {'Кол-во':5} | Names")
+log("-"*120)
+
+row_num = 0
 zebra = False
 for it in sorted_items:
+    row_num += 1
+    names_str = ", ".join(it["names"])
+    log(f"{row_num:3} | {it['material']:20} | {it['length']:8.1f} | {it['operation']:25} | {it['qty']:5} | {names_str}")
     bg = COLOR_ROW_A if zebra else COLOR_ROW_B
     zebra = not zebra
 
     sheet.set("A"+str(row), it["material"])
     sheet.set("B"+str(row), str(it["length"]))
-    sheet.set("C"+str(row), str(it["bevel_start"]))
-    sheet.set("D"+str(row), str(it["bevel_end"]))
-    sheet.set("E"+str(row), str(it["bevel_rotate"]))
-    sheet.set("F"+str(row), str(it["qty"]))
+    sheet.set("C"+str(row), str(it["operation"]))
+    sheet.set("D"+str(row), str(it["qty"]))
 
     for c in cols:
         sheet.setBackground(c+str(row), bg)
         sheet.setForeground(c+str(row), TEXT_COLOR)
 
     row += 1
+
+log("-"*120)
+log(f"Total rows: {row_num}")
+log("="*120)
 
 
 # ---------------- РАСКРОЙ ----------------
